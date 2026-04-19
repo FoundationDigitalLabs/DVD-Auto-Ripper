@@ -1,0 +1,14 @@
+# User-specific configuration (contains local paths)
+config.env
+
+# Log files
+*.log
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Editor files
+*.swp
+*.swo
+*~
