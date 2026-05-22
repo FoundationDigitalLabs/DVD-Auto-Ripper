@@ -12,7 +12,7 @@
 #    - Auto-eject on completion or failure
 #    - Per-disc log files for troubleshooting
 #
-#  Dependencies: makemkvcon, lsblk, eject, tput
+#  Dependencies: makemkvcon, lsblk, eject, tput, findmnt
 #  Config:       config.env (must exist in the same directory)
 #
 #  Usage:        ./auto_rip.sh
@@ -24,10 +24,14 @@
 # ---------------------
 # All user-configurable paths and settings live in config.env.
 # The script will not run without it.
-if [ -f "config.env" ]; then
-    source config.env
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+CONFIG_FILE="$SCRIPT_DIR/config.env"
+
+if [ -f "$CONFIG_FILE" ]; then
+    # shellcheck source=/dev/null
+    source "$CONFIG_FILE"
 else
-    echo "❌ Error: config.env file not found. Please create it."
+    echo "❌ Error: config.env file not found at $CONFIG_FILE. Please create it."
     exit 1
 fi
 
@@ -35,10 +39,91 @@ fi
 # 2. PATH SETUP
 # ---------------------
 # Defaults are provided in case config.env omits a value.
-DRIVE_ROOT="${DRIVE_ROOT:-/media/jake/Backups}"
+DEFAULT_DRIVE_ROOT="${HOME:-$SCRIPT_DIR}/Desktop/DVD-Rips"
+DRIVE_ROOT="${DRIVE_ROOT:-$DEFAULT_DRIVE_ROOT}"
 DEST_FOLDER="${DEST_FOLDER:-$DRIVE_ROOT/MakeMKV}"
 BASE_TEMP="${BASE_TEMP:-$DRIVE_ROOT/temp_rip_work}"
 LOG_DIR="$BASE_TEMP/logs"
+MIN_LENGTH="${MIN_LENGTH:-900}"
+MIN_SPACE_GB="${MIN_SPACE_GB:-10}"
+
+fatal_error() {
+    echo "❌ Error: $1"
+    exit 1
+}
+
+ensure_directory() {
+    local dir="$1"
+    mkdir -p "$dir" || fatal_error "Could not create directory: $dir"
+}
+
+validate_storage_root() {
+    if [ ! -d "$DRIVE_ROOT" ]; then
+        fatal_error "DRIVE_ROOT does not exist: $DRIVE_ROOT"
+    fi
+
+    if [ ! -w "$DRIVE_ROOT" ]; then
+        fatal_error "DRIVE_ROOT is not writable: $DRIVE_ROOT"
+    fi
+
+    if [[ "$DRIVE_ROOT" == /media/* || "$DRIVE_ROOT" == /mnt/* ]]; then
+        if command -v findmnt >/dev/null 2>&1; then
+            local mount_target
+            mount_target=$(findmnt -n -T "$DRIVE_ROOT" -o TARGET 2>/dev/null | head -n 1)
+
+            if [ -z "$mount_target" ] || [ "$mount_target" = "/" ]; then
+                if [ "${ALLOW_UNMOUNTED_DRIVE_ROOT:-0}" != "1" ]; then
+                    fatal_error "$DRIVE_ROOT appears to be under /media or /mnt but is not mounted. Set ALLOW_UNMOUNTED_DRIVE_ROOT=1 only if this is intentional."
+                fi
+            fi
+        else
+            fatal_error "findmnt is required to validate DRIVE_ROOT paths under /media or /mnt."
+        fi
+    fi
+}
+
+validate_numeric_config() {
+    if ! [[ "$MIN_LENGTH" =~ ^[0-9]+$ ]]; then
+        fatal_error "MIN_LENGTH must be a whole number of seconds."
+    fi
+
+    if ! [[ "$MIN_SPACE_GB" =~ ^[0-9]+$ ]]; then
+        fatal_error "MIN_SPACE_GB must be a whole number of GB."
+    fi
+}
+
+clean_disc_name() {
+    local raw_name="$1"
+    local clean_name
+
+    clean_name=$(echo "$raw_name" | tr '_' ' ' | sed 's/[^a-zA-Z0-9 ]//g')
+    clean_name=$(echo "$clean_name" | awk '{
+        out=""
+        for (i=1; i<=NF; i++) {
+            word=toupper(substr($i,1,1)) tolower(substr($i,2))
+            out=(out == "" ? word : out " " word)
+        }
+        print out
+    }')
+    echo "$clean_name"
+}
+
+fallback_disc_name() {
+    date +"Untitled_Disc_%Y%m%d_%H%M%S"
+}
+
+destination_exists_for_name() {
+    local clean_name="$1"
+
+    [ -e "$DEST_FOLDER/$clean_name.mkv" ] && return 0
+    compgen -G "$DEST_FOLDER/${clean_name}_Part*.mkv" >/dev/null && return 0
+
+    return 1
+}
+
+get_free_space_gb() {
+    df -P -BG "$DRIVE_ROOT" 2>/dev/null | awk 'NR==2 {gsub(/G/, "", $4); print $4}'
+}
 
 # Track which disc was last processed to avoid re-ripping the same disc
 LAST_DISC=""
@@ -53,7 +138,9 @@ LAST_ERROR="None"
 CURRENT_STATUS="Waiting for disc..."
 
 # Ensure log directory exists
-mkdir -p "$LOG_DIR"
+validate_numeric_config
+validate_storage_root
+ensure_directory "$LOG_DIR"
 
 # ---------------------
 # 4. DASHBOARD RENDERER
@@ -74,6 +161,24 @@ draw_dashboard() {
     echo "================================================"
     echo ""
     tput ed
+}
+
+record_success() {
+    TOTAL_SUCCESSES=$((TOTAL_SUCCESSES + 1))
+    LAST_ACTIVITY=$(date +"%H:%M:%S")
+    LAST_ERROR="None"
+    CURRENT_STATUS="Waiting for disc..."
+    draw_dashboard
+}
+
+record_failure() {
+    local message="$1"
+
+    TOTAL_FAILURES=$((TOTAL_FAILURES + 1))
+    LAST_ACTIVITY=$(date +"%H:%M:%S")
+    LAST_ERROR="$message"
+    CURRENT_STATUS="Waiting for disc..."
+    draw_dashboard
 }
 
 # Initialize the terminal
@@ -105,39 +210,69 @@ while true; do
     # -------------------------------------------------------------------------
     # STEP 1: CHECK FOR A DISC
     # -------------------------------------------------------------------------
+    # When the tray is empty or open, blockdev returns size 0.
+    # Reset LAST_DISC so the same disc can be re-ripped if reinserted.
+    DRIVE_SIZE=$(blockdev --getsize64 "$DRIVE_PATH" 2>/dev/null)
+
+    if [ "$DRIVE_SIZE" == "0" ] || [ -z "$DRIVE_SIZE" ]; then
+        LAST_DISC=""
+        sleep 10
+        continue
+    fi
+
     # Read the disc's volume label. Strip newlines, carriage returns, and
     # any non-printable characters that some DVDs embed in their labels.
     RAW_NAME=$(lsblk -n -o LABEL "$DRIVE_PATH" 2>/dev/null | tr -d '\n\r' | sed 's/[^[:print:]]//g')
+    DISC_KEY="${RAW_NAME:-unlabeled:$DRIVE_PATH:$DRIVE_SIZE}"
+    DISPLAY_NAME="${RAW_NAME:-Unlabeled disc}"
 
     # -------------------------------------------------------------------------
     # STEP 2: NEW DISC DETECTED?
     # -------------------------------------------------------------------------
-    # Only proceed if a label exists AND it's different from the last disc.
+    # Only proceed if the current disc differs from the last disc.
     # This prevents re-ripping the same disc if it's still in the tray.
-    if [ -n "$RAW_NAME" ] && [ "$RAW_NAME" != "$LAST_DISC" ]; then
+    if [ "$DISC_KEY" != "$LAST_DISC" ]; then
         
-        CURRENT_STATUS="Detecting: $RAW_NAME"
+        CURRENT_STATUS="Detecting: $DISPLAY_NAME"
         draw_dashboard
         
         # --- Name Cleaning ---
         # 1. Replace underscores with spaces
         # 2. Strip any characters that aren't alphanumeric or spaces
         # 3. Convert to Title Case (e.g., "THE DARK KNIGHT" → "The Dark Knight")
-        CLEAN_NAME=$(echo "$RAW_NAME" | tr '_' ' ' | sed 's/[^a-zA-Z0-9 ]//g')
-        CLEAN_NAME=$(echo "$CLEAN_NAME" | awk '{for(i=1;i<=NF;i++) $i=toupper(substr($i,1,1)) tolower(substr($i,2))}1')
+        # 4. Fall back to a timestamped name when a disc has no usable label.
+        CLEAN_NAME=$(clean_disc_name "$RAW_NAME")
+        if [ -z "$CLEAN_NAME" ]; then
+            CLEAN_NAME=$(fallback_disc_name)
+        fi
         
         # ---------------------------------------------------------------------
         # STEP 2.5: DISK SPACE SAFETY CHECK
         # ---------------------------------------------------------------------
         # A typical DVD rip uses 4-8 GB. Abort if less than 10 GB is available
         # to prevent partial rips and system instability from a full disk.
-        FREE_SPACE_GB=$(df -BG "$DRIVE_ROOT" | awk 'NR==2 {print $4}' | tr -d 'G')
-        if [ "$FREE_SPACE_GB" -lt "${MIN_SPACE_GB:-10}" ]; then
+        FREE_SPACE_GB=$(get_free_space_gb)
+        if ! [[ "$FREE_SPACE_GB" =~ ^[0-9]+$ ]]; then
+            echo " ❌ Error: Could not determine free space on $DRIVE_ROOT."
+            record_failure "Free space check failed"
+            LAST_DISC="$DISC_KEY"
+            eject "$DRIVE_PATH"
+            continue
+        fi
+
+        if [ "$FREE_SPACE_GB" -lt "$MIN_SPACE_GB" ]; then
             echo " ❌ Error: Not enough space on $DRIVE_ROOT (${FREE_SPACE_GB}GB free)."
-            LAST_ERROR="Disk full (${FREE_SPACE_GB}GB free)"
-            CURRENT_STATUS="Waiting for disc..."
-            draw_dashboard
-            LAST_DISC="$RAW_NAME"
+            record_failure "Disk full (${FREE_SPACE_GB}GB free)"
+            LAST_DISC="$DISC_KEY"
+            eject "$DRIVE_PATH"
+            continue
+        fi
+
+        ensure_directory "$DEST_FOLDER"
+        if destination_exists_for_name "$CLEAN_NAME"; then
+            echo " ❌ Error: Destination already contains files for $CLEAN_NAME. Refusing to overwrite."
+            record_failure "Output exists for $CLEAN_NAME"
+            LAST_DISC="$DISC_KEY"
             eject "$DRIVE_PATH"
             continue
         fi
@@ -148,8 +283,11 @@ while true; do
         # --- Prepare temp working directory and log file ---
         TEMP_DIR="$BASE_TEMP/temp_$CLEAN_NAME"
         LOG_FILE="$LOG_DIR/rip_$CLEAN_NAME.log"
-        rm -rf "$TEMP_DIR" 
-        mkdir -p "$TEMP_DIR"
+        KEEP_TEMP_DIR=0
+
+        ensure_directory "$BASE_TEMP"
+        rm -rf -- "$TEMP_DIR"
+        ensure_directory "$TEMP_DIR"
         
         # ---------------------------------------------------------------------
         # STEP 3: RIP THE DISC WITH LIVE PROGRESS
@@ -188,64 +326,101 @@ while true; do
                 fi
             fi
         done
+        MAKEMKV_STATUS=${PIPESTATUS[0]}
+        echo "--- Rip Finished: $(date) (makemkvcon exit: $MAKEMKV_STATUS) ---" >> "$LOG_FILE"
         
         # ---------------------------------------------------------------------
         # STEP 4: MOVE, RENAME, AND ORGANIZE
         # ---------------------------------------------------------------------
-        FILE_COUNT=$(ls -1 "$TEMP_DIR"/*.mkv 2>/dev/null | wc -l)
+        mapfile -t MKV_FILES < <(find "$TEMP_DIR" -maxdepth 1 -type f -name "*.mkv" -printf "%T@ %p\n" 2>/dev/null | sort -n | sed 's/^[^ ]* //')
+        FILE_COUNT=${#MKV_FILES[@]}
         
-        if [ "$FILE_COUNT" -eq 1 ]; then
+        if [ "$MAKEMKV_STATUS" -ne 0 ]; then
+            echo " ❌ Error: MakeMKV failed with exit code $MAKEMKV_STATUS. See $LOG_FILE."
+            if [ "$FILE_COUNT" -gt 0 ]; then
+                KEEP_TEMP_DIR=1
+            fi
+            record_failure "MakeMKV failed ($MAKEMKV_STATUS)"
+
+        elif [ "$FILE_COUNT" -eq 1 ]; then
             # --- Single title: rename directly ---
-            mkdir -p "$DEST_FOLDER"
-            mv "$TEMP_DIR"/*.mkv "$DEST_FOLDER/$CLEAN_NAME.mkv"
-            echo " ✅ Success! Saved $CLEAN_NAME.mkv"
-            
-            TOTAL_SUCCESSES=$((TOTAL_SUCCESSES + 1))
-            LAST_ACTIVITY=$(date +"%H:%M:%S")
-            LAST_ERROR="None"
-            CURRENT_STATUS="Waiting for disc..."
-            draw_dashboard
+            DEST_FILE="$DEST_FOLDER/$CLEAN_NAME.mkv"
+
+            if [ -e "$DEST_FILE" ]; then
+                echo " ❌ Error: Destination already exists: $DEST_FILE"
+                KEEP_TEMP_DIR=1
+                record_failure "Output exists for $CLEAN_NAME"
+            elif mv -- "${MKV_FILES[0]}" "$DEST_FILE"; then
+                echo " ✅ Success! Saved $CLEAN_NAME.mkv"
+                record_success
+            else
+                echo " ❌ Error: Failed to move rip to $DEST_FILE"
+                KEEP_TEMP_DIR=1
+                record_failure "Move failed for $CLEAN_NAME"
+            fi
             
         elif [ "$FILE_COUNT" -gt 1 ]; then
             # --- Multiple titles: append _Part01, _Part02, etc. ---
             # Files are sorted by modification time (oldest first) so that
             # part numbers match the order MakeMKV ripped them, regardless
             # of what filenames MakeMKV chose (e.g., title.mkv, 01.mkv).
-            mkdir -p "$DEST_FOLDER"
-            COUNTER=1
-            ls -1tr "$TEMP_DIR"/*.mkv 2>/dev/null | while IFS= read -r f; do
-                printf -v PART_NUM "%02d" "$COUNTER"
-                mv "$f" "$DEST_FOLDER/${CLEAN_NAME}_Part${PART_NUM}.mkv"
-                ((COUNTER++))
-            done
-            echo " ✅ Success! Saved $FILE_COUNT files for $CLEAN_NAME"
+            COLLISION_FOUND=0
+            MOVE_FAILED=0
             
-            TOTAL_SUCCESSES=$((TOTAL_SUCCESSES + 1))
-            LAST_ACTIVITY=$(date +"%H:%M:%S")
-            LAST_ERROR="None"
-            CURRENT_STATUS="Waiting for disc..."
-            draw_dashboard
+            for i in "${!MKV_FILES[@]}"; do
+                printf -v PART_NUM "%02d" "$((i + 1))"
+                DEST_FILE="$DEST_FOLDER/${CLEAN_NAME}_Part${PART_NUM}.mkv"
+
+                if [ -e "$DEST_FILE" ]; then
+                    COLLISION_FOUND=1
+                    break
+                fi
+            done
+
+            if [ "$COLLISION_FOUND" -eq 1 ]; then
+                echo " ❌ Error: Destination already contains a part file for $CLEAN_NAME. Refusing to overwrite."
+                KEEP_TEMP_DIR=1
+                record_failure "Output exists for $CLEAN_NAME"
+            else
+                for i in "${!MKV_FILES[@]}"; do
+                    printf -v PART_NUM "%02d" "$((i + 1))"
+                    DEST_FILE="$DEST_FOLDER/${CLEAN_NAME}_Part${PART_NUM}.mkv"
+
+                    if ! mv -- "${MKV_FILES[$i]}" "$DEST_FILE"; then
+                        MOVE_FAILED=1
+                        break
+                    fi
+                done
+
+                if [ "$MOVE_FAILED" -eq 1 ]; then
+                    echo " ❌ Error: Failed to move all files for $CLEAN_NAME."
+                    KEEP_TEMP_DIR=1
+                    record_failure "Move failed for $CLEAN_NAME"
+                else
+                    echo " ✅ Success! Saved $FILE_COUNT files for $CLEAN_NAME"
+                    record_success
+                fi
+            fi
             
         else
             # --- No MKV files produced ---
             # This usually means no titles met the MIN_LENGTH threshold.
             # Check the log file in $LOG_DIR for details.
-            echo " ❌ Error: No MKV files over ${MIN_LENGTH:-0} seconds were found."
-            
-            TOTAL_FAILURES=$((TOTAL_FAILURES + 1))
-            LAST_ACTIVITY=$(date +"%H:%M:%S")
-            LAST_ERROR="No MKV found for $CLEAN_NAME"
-            CURRENT_STATUS="Waiting for disc..."
-            draw_dashboard
+            echo " ❌ Error: No MKV files over $MIN_LENGTH seconds were found."
+            record_failure "No MKV found for $CLEAN_NAME"
         fi
 
         # --- Cleanup temp directory ---
-        rm -rf "$TEMP_DIR" 2>/dev/null
+        if [ "$KEEP_TEMP_DIR" -eq 1 ]; then
+            echo " ⚠️  Temp files left for inspection: $TEMP_DIR"
+        else
+            rm -rf -- "$TEMP_DIR" 2>/dev/null
+        fi
 
         # ---------------------------------------------------------------------
         # STEP 5: MARK DISC AS DONE
         # ---------------------------------------------------------------------
-        LAST_DISC="$RAW_NAME"
+        LAST_DISC="$DISC_KEY"
 
         # ---------------------------------------------------------------------
         # STEP 6: EJECT THE TRAY
@@ -254,17 +429,6 @@ while true; do
         eject "$DRIVE_PATH"
         echo "----------------------------------------"
         echo " 👀 Waiting for the next disc..."
-    fi
-
-    # -------------------------------------------------------------------------
-    # STEP 7: HARDWARE-LEVEL RESET
-    # -------------------------------------------------------------------------
-    # When the tray is empty or open, blockdev returns size 0.
-    # Reset LAST_DISC so the same disc can be re-ripped if reinserted.
-    DRIVE_SIZE=$(blockdev --getsize64 "$DRIVE_PATH" 2>/dev/null)
-    
-    if [ "$DRIVE_SIZE" == "0" ] || [ -z "$DRIVE_SIZE" ]; then
-        LAST_DISC=""
     fi
 
     sleep 10

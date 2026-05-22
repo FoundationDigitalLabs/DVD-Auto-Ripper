@@ -10,8 +10,10 @@ A fully automated DVD ripping pipeline powered by [MakeMKV](https://www.makemkv.
 | **Live Dashboard** | Real-time terminal UI showing current status, progress bar, success/fail counters, and errors |
 | **Progress Bar** | Parses MakeMKV's robot-mode output to display `[########-------] 55%` during rips |
 | **Smart Naming** | Converts raw disc labels like `THE_DARK_KNIGHT` → `The Dark Knight.mkv` |
+| **Unlabeled Disc Fallback** | Uses a timestamped `Untitled_Disc_YYYYMMDD_HHMMSS` name when a disc has no usable label |
 | **Multi-Part Support** | Discs with multiple titles are automatically numbered `_Part01`, `_Part02`, etc. |
 | **Disk Space Check** | Refuses to start a rip if less than 10 GB is available, preventing partial rips |
+| **Overwrite Protection** | Refuses to replace existing rips with the same cleaned title |
 | **Auto-Eject** | Pops the tray open after every rip (success or failure) so you can swap discs |
 | **Per-Disc Logging** | Each rip generates its own log file for easy troubleshooting |
 
@@ -41,7 +43,7 @@ These are typically pre-installed on most Linux distributions:
 
 ```bash
 # Verify all dependencies are present
-which lsblk eject tput blockdev df
+which lsblk eject tput blockdev df findmnt
 ```
 
 | Tool | Purpose |
@@ -51,6 +53,7 @@ which lsblk eject tput blockdev df
 | `tput` | Controls terminal output for the dashboard (part of `ncurses`) |
 | `blockdev` | Checks if a disc is physically present in the drive |
 | `df` | Checks available disk space before ripping |
+| `findmnt` | Verifies `/media` or `/mnt` storage paths are actually mounted |
 
 ### 3. Hardware
 
@@ -67,25 +70,34 @@ All settings are stored in `config.env`. This file **must exist** in the same di
 
 ```bash
 # Root directory where all rip data is stored
-DRIVE_ROOT="/media/jake/Backups"
+DRIVE_ROOT="$HOME/Desktop/DVD-Rips"
 
 # Final destination for completed .mkv files
 DEST_FOLDER="$DRIVE_ROOT/MakeMKV"
 
-# Temporary working directory (cleaned up automatically after each rip)
+# Temporary working directory.
+# Cleaned up after successful rips; retained when partial files need inspection.
 BASE_TEMP="$DRIVE_ROOT/temp_rip_work"
 
 # Minimum title length in seconds. Titles shorter than this are skipped.
 # Examples: 900 = 15 min, 1800 = 30 min, 3600 = 60 min
 MIN_LENGTH=900
+
+# Minimum free disk space in GB required before starting a rip.
+MIN_SPACE_GB=10
+
+# Set to 1 only if DRIVE_ROOT under /media or /mnt is intentionally not a mount.
+ALLOW_UNMOUNTED_DRIVE_ROOT=0
 ```
 
 | Variable | Default | Description |
 |---|---|---|
-| `DRIVE_ROOT` | `/media/jake/Backups` | Root path for all rip-related storage |
+| `DRIVE_ROOT` | `$HOME/Desktop/DVD-Rips` | Root path for all rip-related storage |
 | `DEST_FOLDER` | `$DRIVE_ROOT/MakeMKV` | Where finished `.mkv` files are saved |
-| `BASE_TEMP` | `$DRIVE_ROOT/temp_rip_work` | Temporary directory during active rips (auto-cleaned) |
+| `BASE_TEMP` | `$DRIVE_ROOT/temp_rip_work` | Temporary directory during active rips; retained for partial files after unsafe failures |
 | `MIN_LENGTH` | `900` | Minimum title length in seconds to include in the rip |
+| `MIN_SPACE_GB` | `10` | Minimum free space required before starting a rip |
+| `ALLOW_UNMOUNTED_DRIVE_ROOT` | `0` | Allows `/media` or `/mnt` paths that are not mounted; keep disabled for external drives |
 
 ---
 
@@ -112,7 +124,13 @@ Edit `config.env` to match your system:
 nano config.env
 ```
 
-Make sure the `DRIVE_ROOT` path exists and has sufficient storage space.
+Make sure the `DRIVE_ROOT` path exists, is mounted when using an external drive, and has sufficient storage space.
+
+For the default example path:
+
+```bash
+mkdir -p "$HOME/Desktop/DVD-Rips"
+```
 
 ### Step 4: Run
 
@@ -152,7 +170,7 @@ When running, the terminal displays a live dashboard:
 | Status | Meaning |
 |---|---|
 | `Waiting for disc...` | Idle — polling the drive every 10 seconds |
-| `Detecting: LABEL` | A new disc label was found, cleaning the name |
+| `Detecting: LABEL` | A new disc was found, cleaning the name |
 | `Ripping: Name [Starting...]` | MakeMKV has launched, waiting for first progress update |
 | `Ripping: Name [####...] XX%` | Actively ripping with real-time progress |
 
@@ -161,7 +179,7 @@ When running, the terminal displays a live dashboard:
 ## 📁 Output Structure
 
 ```
-/media/jake/Backups/
+$HOME/Desktop/DVD-Rips/
 ├── MakeMKV/                        # Finished rips
 │   ├── The Dark Knight.mkv         # Single-title disc
 │   ├── Persuasion_Part01.mkv       # Multi-title disc
@@ -189,6 +207,19 @@ When running, the terminal displays a live dashboard:
 ### "Disk full" error
 - The script requires at least **10 GB** of free space on `$DRIVE_ROOT`
 - Free up space or change `DRIVE_ROOT` to a different volume
+
+### "DRIVE_ROOT appears to be under /media or /mnt but is not mounted"
+- The configured storage path looks like an external drive path, but the drive is not mounted
+- Mount the drive before running the script
+- Only set `ALLOW_UNMOUNTED_DRIVE_ROOT=1` if you intentionally use a normal local directory under `/media` or `/mnt`
+
+### "Destination already contains files"
+- The script refuses to overwrite existing `.mkv` files with the same cleaned disc title
+- Rename or move the existing output before re-ripping the same disc
+
+### "MakeMKV failed"
+- Check the per-disc log in `$BASE_TEMP/logs/`
+- If partial `.mkv` files were produced, the temp directory is left in place for inspection instead of being deleted
 
 ### Progress bar stuck on "Starting..."
 - The `--progress=-stdout` flag is required for MakeMKV to output progress data
