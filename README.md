@@ -35,7 +35,7 @@ sudo apt install makemkv-bin makemkv-oss
 makemkvcon --help
 ```
 
-> **Note:** MakeMKV requires a license key. A free beta key is available at [makemkv.com/forum](https://www.makemkv.com/forum/viewtopic.php?f=5&t=1053) and must be entered in the MakeMKV GUI or written to `~/.MakeMKV/settings.conf`.
+> **Note:** MakeMKV is free while in beta. If MakeMKV prompts for registration, use the current beta key from the official [MakeMKV forum page](https://www.makemkv.com/forum/viewtopic.php?f=5&t=1053) or purchase a permanent key.
 
 ### 2. System Utilities
 
